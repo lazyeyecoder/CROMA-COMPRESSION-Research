@@ -1,0 +1,10 @@
+*.pt
+*.onnx
+*.tif
+*.npy
+*.txt
+*.pdf
+*.docx
+data/
+__pycache__/
+.venv/
