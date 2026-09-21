@@ -1,0 +1,351 @@
+Code history for verify_pipeline
+
+1
+import time
+import torch
+from use_croma import PretrainedCROMA
+
+device = "cpu"
+
+print("1. Loading MARIDA dataset...")
+dataset = torch.load("MARIDA_preprocessed.pt", map_location=device, weights_only=False)
+
+# Inspect tensor shapes
+print(f"   Radar tensor shape:   {dataset['radar'].shape}")
+print(f"   Optical tensor shape: {dataset['optical'].shape}\n")
+
+print("2. Loading CROMA Baseline Model...")
+model = PretrainedCROMA(
+    pretrained_path="CROMA_base.pt",
+    size="base",
+    modality="both",
+    image_resolution=120
+)
+model.to(device)
+model.eval()
+print("   Model loaded successfully!\n")
+
+# 3. Grab a test batch of 4 satellite images
+sar_batch = dataset['radar'][:4].float().to(device)
+opt_batch = dataset['optical'][:4].float().to(device)
+
+print("3. Running Forward Pass & Measuring Baseline Latency...")
+start_time = time.perf_counter()
+
+with torch.no_grad():
+    # Pass SAR + Optical images through CROMA to extract embeddings
+    joint_embeddings, optical_embeddings, sar_embeddings = model(
+        SAR_images=sar_batch, 
+        optical_images=opt_batch
+    )
+
+end_time = time.perf_counter()
+latency_ms = (end_time - start_time) * 1000
+
+print("--- BASELINE SUCCESS ---")
+print(f"Joint Feature Output Shape: {joint_embeddings.shape}")
+print(f"Inference Latency for 4 images: {latency_ms:.2f} ms")
+print(f"Average Latency per image:     {latency_ms / 4:.2f} ms")
+
+2
+import os
+import glob
+import time
+import torch
+import numpy as np
+import rasterio  # Ensure rasterio or tifffile is installed: pip install rasterio
+from use_croma import PretrainedCROMA
+
+device = "cpu"
+
+# ==========================================
+# 1. Official CROMA Normalization
+# ==========================================
+def normalize(x, use_8_bit=False):
+    """
+    Official normalization logic provided in CROMA README.
+    Clips imagery to [mean - 2*std, mean + 2*std] per channel.
+    """
+    x = x.float()
+    imgs = []
+    for channel in range(x.shape[1]):
+        mean_val = x[:, channel, :, :].mean()
+        std_val = x[:, channel, :, :].std()
+        min_value = mean_val - 2 * std_val
+        max_value = mean_val + 2 * std_val
+
+        if use_8_bit:
+            img = (x[:, channel, :, :] - min_value) / (max_value - min_value + 1e-8) * 255.0
+            img = torch.clip(img, 0, 255).unsqueeze(dim=1).to(torch.uint8)
+        else:
+            img = (x[:, channel, :, :] - min_value) / (max_value - min_value + 1e-8)
+            img = torch.clip(img, 0, 1).unsqueeze(dim=1)
+        imgs.append(img)
+
+    return torch.cat(imgs, dim=1)
+
+# ==========================================
+# 2. Helper to Load a Batch from benv1_14k
+# ==========================================
+def load_ben14k_batch(dataset_dir="benv1_14k", batch_size=4):
+    """
+    Loads a batch of spatially aligned S1 (SAR) and S2 (Optical) patches 
+    from the local benv1_14k directory.
+    """
+    # Locate s1 and s2 directories (Updated to match lowercase folders)
+    s1_dirs = sorted(glob.glob(os.path.join(dataset_dir, "s1", "*")))
+    s2_dirs = sorted(glob.glob(os.path.join(dataset_dir, "s2", "*")))
+
+    if not s1_dirs or not s2_dirs:
+        raise ValueError(f"Could not find subdirectories inside {dataset_dir}/s1 or {dataset_dir}/s2. Check your paths!")
+
+    sar_tensors = []
+    opt_tensors = []
+
+    for i in range(min(batch_size, len(s1_dirs))):
+        s1_path = s1_dirs[i]
+        s2_path = s2_dirs[i]
+
+        # Load S1 (2 Channels)
+        if os.path.isfile(s1_path) and s1_path.endswith('.npy'):
+            s1_arr = np.load(s1_path)  # Expected shape: (2, 120, 120)
+        else:
+            # If folder containing band TIFs
+            tif_files = sorted(glob.glob(os.path.join(s1_path, "*.tif")))
+            if len(tif_files) < 2:
+                raise FileNotFoundError(f"Not enough .tif files in {s1_path}")
+            bands = [rasterio.open(f).read(1) for f in tif_files[:2]]
+            s1_arr = np.stack(bands, axis=0)
+
+        # Load S2 (12 Channels)
+        if os.path.isfile(s2_path) and s2_path.endswith('.npy'):
+            s2_arr = np.load(s2_path)  # Expected shape: (12, 120, 120)
+        else:
+            tif_files = sorted(glob.glob(os.path.join(s2_path, "*.tif")))
+            # Drop B10 (cirrus) to keep exactly 12 bands
+            bands = [rasterio.open(f).read(1) for f in tif_files if "B10" not in f][:12]
+            if len(bands) != 12:
+                raise ValueError(f"Expected 12 bands in {s2_path}, found {len(bands)}")
+            s2_arr = np.stack(bands, axis=0)
+
+        sar_tensors.append(torch.from_numpy(s1_arr).float())
+        opt_tensors.append(torch.from_numpy(s2_arr).float())
+
+    sar_batch = torch.stack(sar_tensors)  # Shape: (B, 2, 120, 120)
+    opt_batch = torch.stack(opt_tensors)  # Shape: (B, 12, 120, 120)
+
+    return sar_batch, opt_batch
+
+
+# ==========================================
+# 3. Execution Pipeline
+# ==========================================
+if __name__ == "__main__":
+    print("1. Loading benv1_14k sample batch...")
+    try:
+        # Assuming the script is run from the 'code' directory 
+        # and 'benv1_14k' is inside 'code'
+        sar_raw, opt_raw = load_ben14k_batch("benv1_14k", batch_size=4)
+        print(f"   Raw SAR shape:     {sar_raw.shape}")
+        print(f"   Raw Optical shape: {opt_raw.shape}\n")
+    except Exception as e:
+        print(f"Error loading files directly from folder: {e}")
+        print("Exiting pipeline. Please check the error above.")
+        exit(1)
+
+    print("2. Applying Official CROMA Normalization...")
+    sar_batch = normalize(sar_raw, use_8_bit=False).to(device)  # (4, 2, 120, 120)
+    opt_batch = normalize(opt_raw, use_8_bit=False).to(device)  # (4, 12, 120, 120)
+    print("   Normalization complete!\n")
+
+    print("3. Loading CROMA Baseline Model...")
+    model = PretrainedCROMA(
+        pretrained_path="CROMA_base.pt",
+        size="base",
+        modality="both",
+        image_resolution=120
+    )
+    model.to(device)
+    model.eval()
+    print("   Model loaded successfully!\n")
+
+    print("4. Running Forward Pass & Measuring Latency...")
+    start_time = time.perf_counter()
+
+    with torch.no_grad():
+        outputs = model(SAR_images=sar_batch, optical_images=opt_batch)
+
+    end_time = time.perf_counter()
+    latency_ms = (end_time - start_time) * 1000
+
+    print("\n--- BASELINE SUCCESS ---")
+    print(f"Joint Feature Output Shape ('joint_GAP'):      {outputs['joint_GAP'].shape}")
+    print(f"Joint Patch Encoding Shape ('joint_encodings'): {outputs['joint_encodings'].shape}")
+    print(f"Inference Latency for 4 images:                {latency_ms:.2f} ms")
+    print(f"Average Latency per image:                    {latency_ms / 4:.2f} ms")
+
+3
+import os
+import glob
+import time
+import torch
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from use_croma import PretrainedCROMA
+
+device = "cpu"
+
+# ==========================================
+# 1. Official CROMA Normalization
+# ==========================================
+def normalize(x, use_8_bit=False):
+    x = x.float()
+    imgs = []
+    for channel in range(x.shape[1]):
+        mean_val = x[:, channel, :, :].mean()
+        std_val = x[:, channel, :, :].std()
+        min_value = mean_val - 2 * std_val
+        max_value = mean_val + 2 * std_val
+
+        if use_8_bit:
+            img = (x[:, channel, :, :] - min_value) / (max_value - min_value + 1e-8) * 255.0
+            img = torch.clip(img, 0, 255).unsqueeze(dim=1).to(torch.uint8)
+        else:
+            img = (x[:, channel, :, :] - min_value) / (max_value - min_value + 1e-8)
+            img = torch.clip(img, 0, 1).unsqueeze(dim=1)
+        imgs.append(img)
+
+    return torch.cat(imgs, dim=1)
+
+# ==========================================
+# 2. Helper to Load a Batch from benv1_14k
+# ==========================================
+def read_and_resize(filepath, target_shape=(120, 120)):
+    """Reads a tif file and forces it to a target shape (120x120)."""
+    with rasterio.open(filepath) as dataset:
+        data = dataset.read(
+            1,
+            out_shape=target_shape,
+            resampling=Resampling.bilinear
+        )
+    return data
+
+def load_ben14k_batch(dataset_dir="benv1_14k", batch_size=4):
+    """
+    Loads a batch of spatially aligned S1 (SAR) and S2 (Optical) patches 
+    from the local benv1_14k directory.
+    """
+    s1_dirs = sorted(glob.glob(os.path.join(dataset_dir, "s1", "*")))
+    s2_dirs = sorted(glob.glob(os.path.join(dataset_dir, "s2", "*")))
+
+    if not s1_dirs or not s2_dirs:
+        raise ValueError(f"Could not find subdirectories inside {dataset_dir}/s1 or {dataset_dir}/s2. Check your paths!")
+
+    sar_tensors = []
+    opt_tensors = []
+
+    for i in range(min(batch_size, len(s1_dirs))):
+        s1_path = s1_dirs[i]
+        s2_path = s2_dirs[i]
+
+        # Load S1 (2 Channels)
+        if os.path.isfile(s1_path) and s1_path.endswith('.npy'):
+            s1_arr = np.load(s1_path)
+        else:
+            tif_files = sorted(glob.glob(os.path.join(s1_path, "*.tif")))
+            if len(tif_files) < 2:
+                raise FileNotFoundError(f"Not enough .tif files in {s1_path}")
+            # Resize all SAR bands to 120x120
+            bands = [read_and_resize(f) for f in tif_files[:2]]
+            s1_arr = np.stack(bands, axis=0)
+
+        # Load S2 (12 Channels)
+        if os.path.isfile(s2_path) and s2_path.endswith('.npy'):
+            s2_arr = np.load(s2_path)
+        else:
+            tif_files = sorted(glob.glob(os.path.join(s2_path, "*.tif")))
+            # Drop B10 and resize all optical bands to 120x120
+            bands = [read_and_resize(f) for f in tif_files if "B10" not in f][:12]
+            if len(bands) != 12:
+                raise ValueError(f"Expected 12 bands in {s2_path}, found {len(bands)}")
+            s2_arr = np.stack(bands, axis=0)
+
+        sar_tensors.append(torch.from_numpy(s1_arr).float())
+        opt_tensors.append(torch.from_numpy(s2_arr).float())
+
+    sar_batch = torch.stack(sar_tensors)
+    opt_batch = torch.stack(opt_tensors)
+
+    return sar_batch, opt_batch
+
+
+# ==========================================
+# 3. Execution Pipeline
+# ==========================================
+if __name__ == "__main__":
+    print("1. Loading benv1_14k sample batch...")
+    try:
+        sar_raw, opt_raw = load_ben14k_batch("benv1_14k", batch_size=4)
+        print(f"   Raw SAR shape:     {sar_raw.shape}")
+        print(f"   Raw Optical shape: {opt_raw.shape}\n")
+    except Exception as e:
+        print(f"Error loading files directly from folder: {e}")
+        print("Exiting pipeline. Please check the error above.")
+        exit(1)
+
+    print("2. Applying Official CROMA Normalization...")
+    sar_batch = normalize(sar_raw, use_8_bit=False).to(device)
+    opt_batch = normalize(opt_raw, use_8_bit=False).to(device)
+    print("   Normalization complete!\n")
+
+    print("3. Loading CROMA Baseline Model...")
+    model = PretrainedCROMA(
+        pretrained_path="CROMA_base.pt",
+        size="base",
+        modality="both",
+        image_resolution=120
+    )
+    model.to(device)
+    model.eval()
+    print("   Model loaded successfully!\n")
+
+    print("4. Running Forward Pass & Measuring Latency...")
+    start_time = time.perf_counter()
+
+    with torch.no_grad():
+        outputs = model(SAR_images=sar_batch, optical_images=opt_batch)
+
+    end_time = time.perf_counter()
+    latency_ms = (end_time - start_time) * 1000
+
+    print("\n--- BASELINE SUCCESS ---")
+    print(f"Joint Feature Output Shape ('joint_GAP'):      {outputs['joint_GAP'].shape}")
+    print(f"Joint Patch Encoding Shape ('joint_encodings'): {outputs['joint_encodings'].shape}")
+    print(f"Inference Latency for 4 images:                {latency_ms:.2f} ms")
+    print(f"Average Latency per image:                    {latency_ms / 4:.2f} ms")
+
+OUTPUT:
+1. Loading benv1_14k sample batch...
+C:\The FOLDER\LALLA'S  PROJECT - ACTUALITY\Research Honours\code\verify_pipeline.py:40: DeprecationWarning: Setting the shape on a NumPy array has been deprecated in NumPy 2.5.
+As an alternative, you can create a new view using np.reshape (with copy=False if needed).
+  data = dataset.read(
+   Raw SAR shape:     torch.Size([4, 2, 120, 120])
+   Raw Optical shape: torch.Size([4, 12, 120, 120])
+
+2. Applying Official CROMA Normalization...
+   Normalization complete!
+
+3. Loading CROMA Baseline Model...
+Initializing SAR encoder
+Initializing optical encoder
+Initializing joint SAR-optical encoder
+   Model loaded successfully!
+
+4. Running Forward Pass & Measuring Latency...
+
+--- BASELINE SUCCESS ---
+Joint Feature Output Shape ('joint_GAP'):      torch.Size([4, 768])
+Joint Patch Encoding Shape ('joint_encodings'): torch.Size([4, 225, 768])
+Inference Latency for 4 images:                1818.10 ms
+Average Latency per image:                    454.53 ms

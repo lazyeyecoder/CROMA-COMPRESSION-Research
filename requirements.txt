@@ -1,0 +1,7 @@
+torch
+einops
+requests
+pandas
+pyarrow
+tqdm
+rasterio
