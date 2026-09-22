@@ -1,7 +1,10 @@
-torch
+datasets
 einops
-requests
-pandas
-pyarrow
-tqdm
+huggingface-hub
+numpy
+onnx
+onnxruntime
+Pillow
 rasterio
+torch
+tqdm
